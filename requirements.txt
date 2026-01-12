@@ -1,0 +1,8 @@
+streamlit
+pandas
+langchain==0.2.16
+langchain-community
+langchain-openai
+faiss-cpu
+pypdf
+tiktoken
