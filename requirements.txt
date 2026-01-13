@@ -1,8 +1,9 @@
-streamlit
+streamlit>=1.40.0
 pandas
 langchain==0.2.16
 langchain-community
 langchain-openai
+langchain-google-genai
 faiss-cpu
 pypdf
 tiktoken
