@@ -4,6 +4,7 @@ import sqlite3
 import datetime
 import os
 import hashlib
+import altair as alt  # 引入图表库，用于画漂亮的折线图
 
 # --- 兼容性导入 ---
 try:
@@ -34,17 +35,14 @@ def check_hashes(password, hashed_text):
         return True
     return False
 
-# === 数据库初始化 (升级版) ===
+# === 数据库初始化 ===
 def init_db():
     conn = sqlite3.connect('fitness_data.db', check_same_thread=False)
     c = conn.cursor()
-    # 1. 用户表
     c.execute('''CREATE TABLE IF NOT EXISTS usersTable
                  (username TEXT PRIMARY KEY, password TEXT)''')
-    # 2. 训练表 (增加了 username 字段)
     c.execute('''CREATE TABLE IF NOT EXISTS workouts
                  (username TEXT, date TEXT, body_part TEXT, exercise TEXT, weight REAL, reps INTEGER, sets INTEGER)''')
-    # 3. 饮食表 (增加了 username 字段)
     c.execute('''CREATE TABLE IF NOT EXISTS diet
                  (username TEXT, date TEXT, food_item TEXT, calories REAL, protein REAL, carbs REAL, fat REAL)''')
     conn.commit()
@@ -71,7 +69,6 @@ if 'username' not in st.session_state:
 
 def login_page():
     st.title("🔐 欢迎来到 AI 健身助手")
-    
     menu = ["登录", "注册新账号"]
     choice = st.sidebar.selectbox("菜单", menu)
 
@@ -105,111 +102,92 @@ def login_page():
                 c.execute('INSERT INTO usersTable(username,password) VALUES (?,?)', 
                           (new_user, make_hashes(new_password)))
                 conn.commit()
-                st.success("注册成功！请前往登录菜单登录。")
+                st.success("注册成功！请登录。")
 
-# --- 2. 主程序 (只有登录后才显示) ---
+# --- 2. 主程序 ---
 def main_app():
     current_user = st.session_state['username']
     
-    # 侧边栏显示当前用户
     with st.sidebar:
-        st.markdown(f"### 👤 当前用户: **{current_user}**")
-        if st.button("注销退出"):
+        st.markdown(f"### 👤 用户: **{current_user}**")
+        if st.button("注销"):
             st.session_state['logged_in'] = False
             st.rerun()
-            
+        
         st.markdown("---")
         st.title("⚙️ AI 设置")
-        
-        mode = st.radio("选择模式", ["☁️ 在线 AI (DeepSeek/Google等)", "💻 本地 AI (Ollama/免费)", "📝 仅记录 (无 AI)"])
+        mode = st.radio("模式", ["☁️ 在线 AI", "💻 本地 AI", "📝 仅记录 (无 AI)"])
         
         llm = None
         embeddings = None
         
-        if mode == "☁️ 在线 AI (DeepSeek/Google等)":
-            provider = st.selectbox("服务商", ["OpenAI / 中转 (第三方Key专用)", "Google Gemini (官方)", "DeepSeek (官方)"])
+        if mode == "☁️ 在线 AI":
+            provider = st.selectbox("服务商", ["OpenAI / 中转", "Google Gemini", "DeepSeek"])
             api_key = st.text_input("API Key", type="password")
-            
             base_url = "https://api.openai.com/v1"
             model_name = "gpt-4o-mini"
             
-            if provider == "OpenAI / 中转 (第三方Key专用)":
-                st.info("💡 闲鱼/淘宝 Key 请配置下方参数")
-                base_url = st.text_input("接口地址 (Base URL)", value="https://once.novai.su/v1", help="一定要带 /v1 后缀")
-                model_name = st.text_input("模型名称", value="gemini-1.5-pro", help="卖家提供的模型名")
-                use_local_embed = st.checkbox("✅ 强制使用本地 PDF 引擎 (推荐)", value=True)
+            if provider == "OpenAI / 中转":
+                st.info("💡 第三方 Key 配置")
+                base_url = st.text_input("Base URL", value="https://once.novai.su/v1")
+                model_name = st.text_input("模型名", value="gemini-1.5-pro")
+                use_local_embed = st.checkbox("✅ 强制本地 PDF 引擎", value=True)
             
             if api_key:
                 try:
-                    if provider == "DeepSeek (官方)":
+                    if provider == "DeepSeek":
                         llm = ChatOpenAI(model="deepseek-chat", openai_api_key=api_key, openai_api_base="https://api.deepseek.com")
-                        st.caption("✅ DeepSeek 已连接")
-                    elif provider == "Google Gemini (官方)":
+                    elif provider == "Google Gemini":
                         llm = ChatGoogleGenerativeAI(model="gemini-1.5-flash", google_api_key=api_key)
                         embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001", google_api_key=api_key)
-                        st.caption("✅ Google Gemini 已连接")
                     else:
                         llm = ChatOpenAI(model=model_name, openai_api_key=api_key, openai_api_base=base_url)
                         if use_local_embed:
-                            st.caption("🚀 正在启用本地 PDF 引擎...")
                             embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
-                            st.caption("✅ 本地 PDF 引擎已就绪")
                         else:
-                            try:
-                                embeddings = OpenAIEmbeddings(openai_api_key=api_key, openai_api_base=base_url)
-                            except:
-                                embeddings = None
+                            try: embeddings = OpenAIEmbeddings(openai_api_key=api_key, openai_api_base=base_url)
+                            except: embeddings = None
+                except Exception as e: st.error(f"配置错: {e}")
 
-                except Exception as e:
-                    st.error(f"配置出错: {e}")
-
-        elif mode == "💻 本地 AI (Ollama/免费)":
-            model_name = st.text_input("本地模型名", "deepseek-r1:1.5b")
-            base_url = st.text_input("本地地址", "http://localhost:11434")
-            if st.button("连接本地 AI"):
+        elif mode == "💻 本地 AI":
+            model_name = st.text_input("模型", "deepseek-r1:1.5b")
+            base_url = st.text_input("地址", "http://localhost:11434")
+            if st.button("连接"):
                 try:
                     llm = ChatOllama(model=model_name, base_url=base_url)
                     embeddings = OllamaEmbeddings(model=model_name, base_url=base_url)
                     st.success("已连接")
-                except:
-                    st.error("连接失败")
+                except: st.error("失败")
 
-        # === 自动加载内置知识库 ===
-        if "vector_db" not in st.session_state:
-            st.session_state.vector_db = None
-        
+        # 加载知识库
+        if "vector_db" not in st.session_state: st.session_state.vector_db = None
         if mode != "📝 仅记录 (无 AI)" and embeddings and st.session_state.vector_db is None:
-            st.write("📚 **正在加载知识库...**")
             knowledge_folder = "knowledge"
-            if os.path.exists(knowledge_folder):
-                pdf_files = [f for f in os.listdir(knowledge_folder) if f.endswith('.pdf')]
-                if pdf_files:
-                    try:
-                        all_docs = []
-                        for file in pdf_files:
-                            loader = PyPDFLoader(os.path.join(knowledge_folder, file))
+            if os.path.exists(knowledge_folder) and os.listdir(knowledge_folder):
+                try:
+                    all_docs = []
+                    for f in os.listdir(knowledge_folder):
+                        if f.endswith('.pdf'):
+                            loader = PyPDFLoader(os.path.join(knowledge_folder, f))
                             all_docs.extend(loader.load())
-                        text_splitter = RecursiveCharacterTextSplitter(chunk_size=800, chunk_overlap=100)
-                        splits = text_splitter.split_documents(all_docs)
-                        st.session_state.vector_db = FAISS.from_documents(splits, embeddings)
-                        st.success(f"✅ 已加载 {len(pdf_files)} 本书")
-                    except Exception as e:
-                        st.error(f"加载失败: {e}")
+                    splits = RecursiveCharacterTextSplitter(chunk_size=800, chunk_overlap=100).split_documents(all_docs)
+                    st.session_state.vector_db = FAISS.from_documents(splits, embeddings)
+                    st.success(f"📚 知识库就绪")
+                except: st.warning("知识库加载略过")
 
-    # --- 主界面 Tabs ---
-    tab1, tab2, tab3, tab4 = st.tabs(["🏋️ 训练", "🍽️ 饮食", "📊 看板", "🤖 分析"])
+    tab1, tab2, tab3, tab4 = st.tabs(["🏋️ 训练", "🍽️ 饮食", "📈 进步", "🤖 分析"])
 
-    # === 模块 A: 训练记录 (带用户过滤) ===
+    # === Tab 1: 训练记录 ===
     with tab1:
         st.subheader(f"🔥 {current_user} 的快速打卡")
-        part_selected = st.pills("Part", list(GYM_MENU.keys()), default="胸", selection_mode="single")
+        part_selected = st.pills("部位", list(GYM_MENU.keys()), default="胸", selection_mode="single")
         exercise_list = GYM_MENU.get(part_selected, ["自定义"])
-        exercise_selected = st.pills("Exercise", exercise_list, default=exercise_list[0], selection_mode="single")
+        exercise_selected = st.pills("动作", exercise_list, default=exercise_list[0], selection_mode="single")
         st.markdown("---")
         c1, c2 = st.columns(2)
         with c1: w_weight = st.number_input("重量 (kg)", value=0.0, step=2.5)
-        with c2: w_reps = st.number_input("每组次数", value=8, step=1)
-        w_sets = st.pills("Sets", [1, 2, 3, 4, 5], default=1, selection_mode="single")
+        with c2: w_reps = st.number_input("次数", value=8, step=1)
+        w_sets = st.pills("组数", [1, 2, 3, 4, 5], default=1, selection_mode="single")
         st.markdown("<br>", unsafe_allow_html=True) 
         if st.button("✅ 确认保存", use_container_width=True, type="primary"):
             c.execute("INSERT INTO workouts VALUES (?, ?, ?, ?, ?, ?, ?)", 
@@ -217,75 +195,115 @@ def main_app():
             conn.commit()
             st.success(f"已保存: {exercise_selected}")
 
-    # === 模块 B: 饮食记录 (带用户过滤) ===
+    # === Tab 2: 饮食记录 ===
     with tab2:
         st.subheader("饮食")
         d_input = st.text_input("吃了什么？")
         c1, c2 = st.columns(2)
-        if c1.button("直接记录"):
+        if c1.button("记录"):
             c.execute("INSERT INTO diet VALUES (?, ?, ?, ?, ?, ?, ?)", 
                       (current_user, str(datetime.date.today()), d_input, 0, 0, 0, 0)) 
             conn.commit()
             st.success("已记录")
+        if c2.button("AI 估算") and llm:
+            with st.spinner("计算中..."):
+                try:
+                    res = llm.invoke(f"分析食物:'{d_input}'。返回格式:食物名,热量,蛋白,碳水,脂肪。例:面,300,10,60,5").content
+                    item, cal, prot, carb, fat = res.replace("`","").strip().split(',')
+                    c.execute("INSERT INTO diet VALUES (?, ?, ?, ?, ?, ?, ?)", 
+                              (current_user, str(datetime.date.today()), item, float(cal), float(prot), float(carb), float(fat)))
+                    conn.commit()
+                    st.success(f"已记录: {item}")
+                except: st.error("AI 解析失败")
 
-        if c2.button("AI 估算"):
-            if not llm: st.error("请先配置 AI")
-            else:
-                with st.spinner("AI 计算中..."):
-                    try:
-                        prompt = f"分析食物：'{d_input}'。只返回5个数字用逗号隔开：食物名,热量,蛋白,碳水,脂肪。例：面,300,10,60,5"
-                        res = llm.invoke(prompt).content
-                        clean = res.replace("`", "").replace("\n", "").strip()
-                        parts = clean.split(',')
-                        item, cal, prot, carb, fat = parts[0], parts[1], parts[2], parts[3], parts[4]
-                        c.execute("INSERT INTO diet VALUES (?, ?, ?, ?, ?, ?, ?)", 
-                                  (current_user, str(datetime.date.today()), item, float(cal), float(prot), float(carb), float(fat)))
-                        conn.commit()
-                        st.success(f"已记录: {item}")
-                    except: st.error("AI 解析失败")
-
-    # === 模块 C: 数据看板 (只看自己的数据) ===
+    # === Tab 3: 进步可视化 (核心修改) ===
     with tab3:
-        st.subheader("数据管理")
-        # 核心：SQL语句增加了 WHERE username = ?
-        df_w = pd.read_sql_query("SELECT * FROM workouts WHERE username = ?", conn, params=(current_user,))
-        if not df_w.empty:
-            df_w['vol'] = df_w['weight'] * df_w['sets'] * df_w['reps']
-            st.line_chart(df_w.groupby('date')['vol'].sum())
-            csv = df_w.to_csv(index=False).encode('utf-8-sig')
-            st.download_button("📥 导出 CSV", csv, "my_data.csv", "text/csv")
+        st.subheader("📈 见证你的变强之路")
+        
+        # 1. 获取该用户练过的所有动作
+        df_all = pd.read_sql_query("SELECT DISTINCT exercise FROM workouts WHERE username = ?", conn, params=(current_user,))
+        
+        if df_all.empty:
+            st.info("👋 你还没有训练记录，快去 Tab 1 打卡第一次训练吧！")
         else:
-            st.info("暂无数据，快去训练吧！")
+            # 2. 动作选择器
+            exercise_list = df_all['exercise'].tolist()
+            target_exercise = st.selectbox("请选择要查看的动作", exercise_list)
+            
+            # 3. 获取该动作的历史数据 (只取每天的最大重量作为代表)
+            query = """
+                SELECT date, MAX(weight) as max_weight 
+                FROM workouts 
+                WHERE username = ? AND exercise = ? 
+                GROUP BY date 
+                ORDER BY date ASC
+            """
+            df_hist = pd.read_sql_query(query, conn, params=(current_user, target_exercise))
+            
+            if not df_hist.empty:
+                # 4. 数据计算与文案生成
+                latest_weight = df_hist.iloc[-1]['max_weight']  # 当前重量
+                start_weight = df_hist.iloc[0]['max_weight']    # 初始重量
+                
+                # 计算长期变化
+                total_growth = latest_weight - start_weight
+                if start_weight > 0:
+                    growth_pct = int((total_growth / start_weight) * 100)
+                else:
+                    growth_pct = 0
+                
+                # 计算短期变化 (和上一次比)
+                if len(df_hist) >= 2:
+                    prev_weight = df_hist.iloc[-2]['max_weight']
+                    short_change = latest_weight - prev_weight
+                else:
+                    prev_weight = latest_weight
+                    short_change = 0
+                
+                # 生成激励文案
+                long_term_msg = f"比初始提升了 {growth_pct}%" if growth_pct > 0 else "保持初心"
+                
+                short_term_msg = ""
+                if short_change > 0:
+                    short_term_msg = f"，比上一次增加了 {short_change}kg 🔥"
+                elif short_change == 0:
+                    short_term_msg = "，与上次持平 🛡️"
+                else:
+                    short_term_msg = f"，调整状态 ({short_change}kg) 💤"
 
-    # === 模块 D: AI 分析 (只分析自己的数据) ===
+                final_msg = f"**{target_exercise}** {long_term_msg}{short_term_msg}"
+
+                # 5. 绘制 Altair 漂亮图表 (带交互)
+                chart = alt.Chart(df_hist).mark_line(point=True).encode(
+                    x=alt.X('date', title='训练日期'),
+                    y=alt.Y('max_weight', title='重量 (kg)', scale=alt.Scale(zero=False)),
+                    tooltip=['date', 'max_weight']
+                ).properties(
+                    height=300
+                ).interactive()
+
+                st.altair_chart(chart, use_container_width=True)
+                
+                # 6. 显示简洁有力的结果
+                st.info(final_msg)
+            else:
+                st.warning("暂无数据")
+
+    # === Tab 4: AI 分析 ===
     with tab4:
         st.subheader("教练点评")
-        if st.button("生成报告"):
-            if not llm: st.warning("请配置 AI")
-            else:
-                # 只获取当前用户的数据
-                user_data = pd.read_sql_query("SELECT * FROM workouts WHERE username = ?", conn, params=(current_user,)).to_string()
-                
-                if st.session_state.vector_db:
-                    retriever = st.session_state.vector_db.as_retriever()
-                    prompt = ChatPromptTemplate.from_messages([
-                        ("system", "基于书籍：\n{context}\n\n分析用户数据：\n{input}\n\n给出建议。"),
-                    ])
-                    chain = create_retrieval_chain(retriever, create_stuff_documents_chain(llm, prompt))
-                    input_pkg = {"input": user_data}
-                else:
-                    prompt = ChatPromptTemplate.from_messages([("system", "分析数据："), ("human", "{input}")])
-                    chain = prompt | llm
-                    input_pkg = {"input": user_data}
+        if st.button("生成报告") and llm:
+            user_data = pd.read_sql_query("SELECT * FROM workouts WHERE username = ?", conn, params=(current_user,)).to_string()
+            with st.spinner("分析中..."):
+                try:
+                    prompt = f"基于数据:\n{user_data}\n\n给出专业简短的训练建议。"
+                    if st.session_state.vector_db:
+                        retriever = st.session_state.vector_db.as_retriever()
+                        chain = create_retrieval_chain(retriever, create_stuff_documents_chain(llm, ChatPromptTemplate.from_messages([("system", "基于书籍:{context}\n分析:{input}")])))
+                        st.markdown(chain.invoke({"input": user_data})["answer"])
+                    else:
+                        st.markdown(llm.invoke(prompt).content)
+                except Exception as e: st.error(f"失败: {e}")
 
-                with st.spinner("AI 分析中..."):
-                    try:
-                        if st.session_state.vector_db: st.markdown(chain.invoke(input_pkg)["answer"])
-                        else: st.markdown(chain.invoke(input_pkg).content)
-                    except Exception as e: st.error(f"失败: {e}")
-
-# --- 程序入口 ---
-if st.session_state['logged_in']:
-    main_app()
-else:
-    login_page()
+if st.session_state['logged_in']: main_app()
+else: login_page()
