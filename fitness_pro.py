@@ -24,7 +24,7 @@ except ImportError as e:
 # --- 0. 配置与初始化 ---
 st.set_page_config(page_title="AI 健身助手 Pro", page_icon="🏋️", layout="wide")
 
-# === 新增：预设动作库 (可以自己添加更多) ===
+# === 预设动作库 ===
 GYM_MENU = {
     "胸": ["平板卧推", "上斜卧推", "哑铃卧推", "器械夹胸", "双杠臂屈伸", "绳索夹胸"],
     "背": ["引体向上", "高位下拉", "杠铃划船", "坐姿划船", "直臂下压", "单臂哑铃划船"],
@@ -83,62 +83,75 @@ with st.sidebar:
             except:
                 st.error("连接失败，请检查 Ollama 是否运行")
 
-    if mode != "📝 仅记录 (无 AI)":
+    # === 新增：自动加载内置知识库 ===
+    if "vector_db" not in st.session_state:
+        st.session_state.vector_db = None
+    
+    # 只有在有 AI 且有 Embeddings 的情况下才加载知识库
+    if mode != "📝 仅记录 (无 AI)" and embeddings and st.session_state.vector_db is None:
         st.markdown("---")
-        uploaded_file = st.file_uploader("上传 PDF 知识库", type="pdf")
-        if "vector_db" not in st.session_state:
-            st.session_state.vector_db = None
-
-        if uploaded_file and embeddings and st.session_state.vector_db is None:
-            with st.spinner("正在解析 PDF..."):
+        st.write("📚 **正在加载内置知识库...**")
+        
+        knowledge_folder = "knowledge"
+        
+        # 检查文件夹是否存在
+        if not os.path.exists(knowledge_folder):
+             st.warning(f"⚠️ 未找到 '{knowledge_folder}' 文件夹，AI 将仅凭常识回答。")
+        else:
+            pdf_files = [f for f in os.listdir(knowledge_folder) if f.endswith('.pdf')]
+            
+            if not pdf_files:
+                st.warning("⚠️ 知识库文件夹是空的。")
+            else:
+                progress_bar = st.progress(0)
+                all_docs = []
+                
                 try:
-                    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_file:
-                        tmp_file.write(uploaded_file.getvalue())
-                        tmp_path = tmp_file.name
-                    loader = PyPDFLoader(tmp_path)
-                    docs = loader.load()
+                    for i, file in enumerate(pdf_files):
+                        file_path = os.path.join(knowledge_folder, file)
+                        loader = PyPDFLoader(file_path)
+                        all_docs.extend(loader.load())
+                        progress_bar.progress((i + 1) / len(pdf_files))
+                    
+                    # 切分文档
                     text_splitter = RecursiveCharacterTextSplitter(chunk_size=800, chunk_overlap=100)
-                    splits = text_splitter.split_documents(docs)
+                    splits = text_splitter.split_documents(all_docs)
+                    
+                    # 建立向量库
                     st.session_state.vector_db = FAISS.from_documents(splits, embeddings)
-                    st.success("知识库加载完毕！")
-                    os.remove(tmp_path)
+                    st.success(f"✅ 已加载 {len(pdf_files)} 本专业书籍！")
+                    
                 except Exception as e:
-                    st.warning("知识库加载失败 (可能是模型不支持 Embeddings)")
+                    st.error(f"加载失败: {e}")
+
+    # 显示知识库状态
+    if st.session_state.vector_db:
+         st.markdown("✅ **内置专业知识库：已激活**")
 
 # --- 2. 主界面 ---
 tab1, tab2, tab3, tab4 = st.tabs(["🏋️ 训练", "🍽️ 饮食", "📊 看板", "🤖 分析"])
 
-# === 模块 A: 训练记录 (全新 UI) ===
+# === 模块 A: 训练记录 ===
 with tab1:
     st.subheader("🔥 快速打卡")
-    
-    # 1. 第一行：选择部位 (胶囊按钮)
     st.caption("1. 选择部位")
-    # 使用 pills 替代 selectbox，selection_mode="single" 确保单选
     part_selected = st.pills("Part", list(GYM_MENU.keys()), default="胸", selection_mode="single", label_visibility="collapsed")
     
-    # 2. 第二行：选择动作 (根据部位动态变化)
     st.caption(f"2. 选择 {part_selected} 的动作")
-    # 获取该部位对应的动作列表，默认选第一个
     exercise_list = GYM_MENU.get(part_selected, ["自定义动作"])
     exercise_selected = st.pills("Exercise", exercise_list, default=exercise_list[0], selection_mode="single", label_visibility="collapsed")
     
     st.markdown("---")
     
-    # 3. 第三行：重量、次数、组数
     c1, c2 = st.columns(2)
-    with c1:
-        w_weight = st.number_input("重量 (kg)", value=0.0, step=2.5)
-    with c2:
-        w_reps = st.number_input("每组次数", value=8, step=1)
+    with c1: w_weight = st.number_input("重量 (kg)", value=0.0, step=2.5)
+    with c2: w_reps = st.number_input("每组次数", value=8, step=1)
         
     st.caption("3. 选择组数")
-    # 组数也改成按钮选择 (1-5组)
     w_sets = st.pills("Sets", [1, 2, 3, 4, 5], default=1, selection_mode="single", label_visibility="collapsed")
     
-    st.markdown("<br>", unsafe_allow_html=True) # 增加一点空隙
+    st.markdown("<br>", unsafe_allow_html=True) 
     
-    # 4. 保存按钮 (加大加宽)
     if st.button("✅ 确认保存", use_container_width=True, type="primary"):
         c = conn.cursor()
         c.execute("INSERT INTO workouts VALUES (?, ?, ?, ?, ?, ?)", 
@@ -150,7 +163,6 @@ with tab1:
 with tab2:
     st.subheader("饮食")
     d_input = st.text_input("吃了什么？", placeholder="例如：牛肉面一碗")
-    
     col_d1, col_d2 = st.columns([1, 1])
     if col_d1.button("直接记录"):
         c = conn.cursor()
@@ -161,7 +173,7 @@ with tab2:
 
     if col_d2.button("AI 估算"):
         if not llm:
-            st.error("请先在左侧连接 AI")
+            st.error("请先连接 AI")
         else:
             with st.spinner("AI 计算中..."):
                 try:
@@ -188,7 +200,7 @@ with tab3:
     else:
         st.info("暂无数据")
 
-# === 模块 D: AI 分析 ===
+# === 模块 D: AI 分析 (自动检索内置知识库) ===
 with tab4:
     st.subheader("教练点评")
     if st.button("生成报告"):
@@ -197,13 +209,17 @@ with tab4:
         else:
             w_data = pd.read_sql_query(f"SELECT * FROM workouts", conn).to_string()
             
+            # 判断是否加载了知识库
             if st.session_state.vector_db:
                 retriever = st.session_state.vector_db.as_retriever()
+                # 提示词修改：强调使用内置的 Context
                 prompt = ChatPromptTemplate.from_messages([
-                    ("system", "你是专业教练。参考书本：\n{context}\n\n分析用户数据：\n{input}\n\n给出建议。"),
+                    ("system", "你是一名专业教练。你的大脑里装载了专业的健身书籍知识（Context）。\n\n请严格基于以下书籍内容：\n{context}\n\n来分析用户的训练数据：\n{input}\n\n如果没有相关内容，则用通用知识回答。"),
                 ])
                 chain = create_retrieval_chain(retriever, create_stuff_documents_chain(llm, prompt))
                 input_pkg = {"input": w_data}
+                
+                st.info("🔍 AI 正在查阅内置的健身书籍...")
             else:
                 prompt = ChatPromptTemplate.from_messages([
                     ("system", "你是专业教练。分析以下训练数据并给出建议："),
@@ -212,10 +228,11 @@ with tab4:
                 chain = prompt | llm
                 input_pkg = {"input": w_data}
 
-            with st.spinner("AI 思考中..."):
+            with st.spinner("AI 正在撰写报告..."):
                 try:
                     if st.session_state.vector_db:
-                        st.markdown(chain.invoke(input_pkg)["answer"])
+                        res = chain.invoke(input_pkg)
+                        st.markdown(res["answer"])
                     else:
                         st.markdown(chain.invoke(input_pkg).content)
                 except Exception as e:
