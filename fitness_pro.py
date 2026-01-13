@@ -4,7 +4,8 @@ import sqlite3
 import datetime
 import os
 import hashlib
-import altair as alt  # 引入图表库，用于画漂亮的折线图
+import altair as alt
+import numpy as np
 
 # --- 兼容性导入 ---
 try:
@@ -35,14 +36,28 @@ def check_hashes(password, hashed_text):
         return True
     return False
 
-# === 数据库初始化 ===
+# === 数据库初始化 (自动迁移 RPE 字段) ===
 def init_db():
     conn = sqlite3.connect('fitness_data.db', check_same_thread=False)
     c = conn.cursor()
+    
+    # 1. 创建基础表
     c.execute('''CREATE TABLE IF NOT EXISTS usersTable
                  (username TEXT PRIMARY KEY, password TEXT)''')
+    
+    # 2. 训练表 (尝试添加 rpe 列，兼容旧数据)
     c.execute('''CREATE TABLE IF NOT EXISTS workouts
-                 (username TEXT, date TEXT, body_part TEXT, exercise TEXT, weight REAL, reps INTEGER, sets INTEGER)''')
+                 (username TEXT, date TEXT, body_part TEXT, exercise TEXT, weight REAL, reps INTEGER, sets INTEGER, rpe REAL)''')
+    
+    # 检查 rpe 列是否存在，不存在则添加
+    try:
+        c.execute("SELECT rpe FROM workouts LIMIT 1")
+    except sqlite3.OperationalError:
+        st.toast("正在升级数据库结构...", icon="🛠️")
+        c.execute("ALTER TABLE workouts ADD COLUMN rpe REAL DEFAULT 0")
+        conn.commit()
+
+    # 3. 饮食表
     c.execute('''CREATE TABLE IF NOT EXISTS diet
                  (username TEXT, date TEXT, food_item TEXT, calories REAL, protein REAL, carbs REAL, fat REAL)''')
     conn.commit()
@@ -50,6 +65,14 @@ def init_db():
 
 conn = init_db()
 c = conn.cursor()
+
+# === 科学计算公式 ===
+def calculate_e1rm(weight, reps):
+    """Brzycki 公式: 估算 1RM"""
+    if reps == 1: return weight
+    # 防止分母为0或负数 (虽然健身中 reps 通常 < 30)
+    if reps >= 37: reps = 36 
+    return weight / (1.0278 - (0.0278 * reps))
 
 # === 预设动作库 ===
 GYM_MENU = {
@@ -175,25 +198,31 @@ def main_app():
                     st.success(f"📚 知识库就绪")
                 except: st.warning("知识库加载略过")
 
-    tab1, tab2, tab3, tab4 = st.tabs(["🏋️ 训练", "🍽️ 饮食", "📈 进步", "🤖 分析"])
+    tab1, tab2, tab3, tab4 = st.tabs(["🏋️ 训练", "🍽️ 饮食", "📊 专业分析", "🤖 AI 教练"])
 
-    # === Tab 1: 训练记录 ===
+    # === Tab 1: 训练记录 (新增 RPE) ===
     with tab1:
         st.subheader(f"🔥 {current_user} 的快速打卡")
         part_selected = st.pills("部位", list(GYM_MENU.keys()), default="胸", selection_mode="single")
         exercise_list = GYM_MENU.get(part_selected, ["自定义"])
         exercise_selected = st.pills("动作", exercise_list, default=exercise_list[0], selection_mode="single")
+        
         st.markdown("---")
-        c1, c2 = st.columns(2)
+        c1, c2, c3 = st.columns([1, 1, 1])
         with c1: w_weight = st.number_input("重量 (kg)", value=0.0, step=2.5)
         with c2: w_reps = st.number_input("次数", value=8, step=1)
+        # RPE 滑块
+        with c3: w_rpe = st.slider("RPE (自觉疲劳度)", min_value=1.0, max_value=10.0, value=8.0, step=0.5, help="10=力竭, 9=还能做1个, 8=还能做2个")
+        
         w_sets = st.pills("组数", [1, 2, 3, 4, 5], default=1, selection_mode="single")
+        
         st.markdown("<br>", unsafe_allow_html=True) 
         if st.button("✅ 确认保存", use_container_width=True, type="primary"):
-            c.execute("INSERT INTO workouts VALUES (?, ?, ?, ?, ?, ?, ?)", 
-                      (current_user, str(datetime.date.today()), part_selected, exercise_selected, w_weight, w_reps, w_sets))
+            # 插入数据 (带 RPE)
+            c.execute("INSERT INTO workouts VALUES (?, ?, ?, ?, ?, ?, ?, ?)", 
+                      (current_user, str(datetime.date.today()), part_selected, exercise_selected, w_weight, w_reps, w_sets, w_rpe))
             conn.commit()
-            st.success(f"已保存: {exercise_selected}")
+            st.success(f"已保存: {exercise_selected} | RPE {w_rpe}")
 
     # === Tab 2: 饮食记录 ===
     with tab2:
@@ -216,91 +245,127 @@ def main_app():
                     st.success(f"已记录: {item}")
                 except: st.error("AI 解析失败")
 
-    # === Tab 3: 进步可视化 (核心修改) ===
+    # === Tab 3: 专业分析 (三个高级图表) ===
     with tab3:
-        st.subheader("📈 见证你的变强之路")
+        st.subheader("📈 训练表现深度分析")
         
-        # 1. 获取该用户练过的所有动作
+        # 1. 获取所有动作列表
         df_all = pd.read_sql_query("SELECT DISTINCT exercise FROM workouts WHERE username = ?", conn, params=(current_user,))
         
         if df_all.empty:
-            st.info("👋 你还没有训练记录，快去 Tab 1 打卡第一次训练吧！")
+            st.info("👋 暂无数据，请先去 Tab 1 打卡！")
         else:
-            # 2. 动作选择器
             exercise_list = df_all['exercise'].tolist()
-            target_exercise = st.selectbox("请选择要查看的动作", exercise_list)
+            target_exercise = st.selectbox("选择要分析的动作", exercise_list)
             
-            # 3. 获取该动作的历史数据 (只取每天的最大重量作为代表)
-            query = """
-                SELECT date, MAX(weight) as max_weight 
+            # 获取该动作的所有历史记录
+            df_raw = pd.read_sql_query("""
+                SELECT date, weight, reps, sets, rpe 
                 FROM workouts 
                 WHERE username = ? AND exercise = ? 
-                GROUP BY date 
                 ORDER BY date ASC
-            """
-            df_hist = pd.read_sql_query(query, conn, params=(current_user, target_exercise))
+            """, conn, params=(current_user, target_exercise))
             
-            if not df_hist.empty:
-                # 4. 数据计算与文案生成
-                latest_weight = df_hist.iloc[-1]['max_weight']  # 当前重量
-                start_weight = df_hist.iloc[0]['max_weight']    # 初始重量
+            if not df_raw.empty:
+                # --- 数据预处理 (Pandas 魔法) ---
+                # 1. 计算每一组的 e1RM 和 容量
+                df_raw['e1rm_set'] = df_raw.apply(lambda x: calculate_e1rm(x['weight'], x['reps']), axis=1)
+                df_raw['volume_set'] = df_raw['weight'] * df_raw['reps'] * df_raw['sets']
+                df_raw['total_reps_set'] = df_raw['reps'] * df_raw['sets']
                 
-                # 计算长期变化
-                total_growth = latest_weight - start_weight
-                if start_weight > 0:
-                    growth_pct = int((total_growth / start_weight) * 100)
-                else:
-                    growth_pct = 0
+                # 2. 按日期聚合 (Daily Aggregation)
+                # 每天的数据：最大 e1RM，总容量，加权平均强度
+                daily_stats = df_raw.groupby('date').apply(lambda x: pd.Series({
+                    'daily_e1rm': x['e1rm_set'].max(),  # 当天表现最好的那一组作为当天极限
+                    'total_volume': x['volume_set'].sum(),
+                    'total_reps': x['total_reps_set'].sum(),
+                    'weighted_avg_weight': x['volume_set'].sum() / x['total_reps_set'].sum() if x['total_reps_set'].sum() > 0 else 0
+                })).reset_index()
                 
-                # 计算短期变化 (和上一次比)
-                if len(df_hist) >= 2:
-                    prev_weight = df_hist.iloc[-2]['max_weight']
-                    short_change = latest_weight - prev_weight
-                else:
-                    prev_weight = latest_weight
-                    short_change = 0
+                # 3. 计算相对强度 % (平均负重 / 当天e1RM)
+                daily_stats['intensity_pct'] = (daily_stats['weighted_avg_weight'] / daily_stats['daily_e1rm']) * 100
                 
-                # 生成激励文案
-                long_term_msg = f"比初始提升了 {growth_pct}%" if growth_pct > 0 else "保持初心"
-                
-                short_term_msg = ""
-                if short_change > 0:
-                    short_term_msg = f"，比上一次增加了 {short_change}kg 🔥"
-                elif short_change == 0:
-                    short_term_msg = "，与上次持平 🛡️"
-                else:
-                    short_term_msg = f"，调整状态 ({short_change}kg) 💤"
+                # 4. 为了 Chart C，我们需要保留原始的每组数据，并附带当天的 e1RM
+                df_scatter = pd.merge(df_raw, daily_stats[['date', 'daily_e1rm']], on='date', how='left')
+                df_scatter['relative_intensity'] = (df_scatter['weight'] / df_scatter['daily_e1rm']) * 100
+                df_scatter = df_scatter[df_scatter['rpe'] > 0] # 过滤掉没记RPE的数据
 
-                final_msg = f"**{target_exercise}** {long_term_msg}{short_term_msg}"
-
-                # 5. 绘制 Altair 漂亮图表 (带交互)
-                chart = alt.Chart(df_hist).mark_line(point=True).encode(
-                    x=alt.X('date', title='训练日期'),
-                    y=alt.Y('max_weight', title='重量 (kg)', scale=alt.Scale(zero=False)),
-                    tooltip=['date', 'max_weight']
-                ).properties(
-                    height=300
-                ).interactive()
-
-                st.altair_chart(chart, use_container_width=True)
+                # === 图表 A: 1RM 增长趋势 (Brzycki) ===
+                st.markdown("#### 🅰️ 极限力量趋势 (e1RM)")
+                st.caption("基于 Brzycki 公式估算的单次极限重量")
                 
-                # 6. 显示简洁有力的结果
-                st.info(final_msg)
+                chart_a = alt.Chart(daily_stats).mark_line(point=True, color='#FF4B4B').encode(
+                    x=alt.X('date', title='日期'),
+                    y=alt.Y('daily_e1rm', title='估算 1RM (kg)', scale=alt.Scale(zero=False)),
+                    tooltip=['date', alt.Tooltip('daily_e1rm', format='.1f')]
+                ).properties(height=300)
+                
+                # 添加趋势线 (回归线)
+                trend_line = chart_a.transform_regression('date', 'daily_e1rm').mark_line(strokeDash=[5, 5], color='grey')
+                st.altair_chart(chart_a + trend_line, use_container_width=True)
+
+                # === 图表 B: 容量 vs 相对强度 (双轴图) ===
+                st.markdown("#### 🅱️ 训练容量与强度对比")
+                st.caption("柱状图 = 总容量 (kg) | 折线 = 平均强度 (%)")
+                
+                base = alt.Chart(daily_stats).encode(x=alt.X('date', title='日期'))
+                
+                # 左轴：容量 (柱状图)
+                bar_vol = base.mark_bar(opacity=0.3, color='#1f77b4').encode(
+                    y=alt.Y('total_volume', title='总容量 (kg)', axis=alt.Axis(titleColor='#1f77b4')),
+                    tooltip=['date', 'total_volume']
+                )
+                
+                # 右轴：强度 (折线图)
+                line_int = base.mark_line(point=True, color='#d62728').encode(
+                    y=alt.Y('intensity_pct', title='相对强度 (%)', axis=alt.Axis(titleColor='#d62728'), scale=alt.Scale(domain=[50, 100])),
+                    tooltip=['date', alt.Tooltip('intensity_pct', format='.1f')]
+                )
+                
+                # 组合双轴
+                st.altair_chart(alt.layer(bar_vol, line_int).resolve_scale(y='independent'), use_container_width=True)
+
+                # === 图表 C: RPE 分散度 (散点图) ===
+                st.markdown("#### 🅾️ RPE vs 强度分布")
+                st.caption("合理的训练应分布在对角线附近 (高强度对应高 RPE)")
+                
+                if not df_scatter.empty:
+                    chart_c = alt.Chart(df_scatter).mark_circle(size=100).encode(
+                        x=alt.X('relative_intensity', title='相对强度 (% 1RM)', scale=alt.Scale(domain=[40, 105])),
+                        y=alt.Y('rpe', title='RPE (1-10)', scale=alt.Scale(domain=[5, 10])),
+                        color=alt.value('orange'),
+                        tooltip=['date', 'weight', 'reps', 'rpe', alt.Tooltip('relative_intensity', format='.1f')]
+                    ).properties(height=350)
+                    
+                    # 添加辅助区域 (理想区间)
+                    st.altair_chart(chart_c, use_container_width=True)
+                else:
+                    st.warning("⚠️ 暂无 RPE 数据，请在录入时填写 RPE。")
+
             else:
-                st.warning("暂无数据")
+                st.warning("数据不足，无法分析。")
 
-    # === Tab 4: AI 分析 ===
+    # === Tab 4: AI 教练 ===
     with tab4:
         st.subheader("教练点评")
-        if st.button("生成报告") and llm:
-            user_data = pd.read_sql_query("SELECT * FROM workouts WHERE username = ?", conn, params=(current_user,)).to_string()
-            with st.spinner("分析中..."):
+        if st.button("生成深度报告") and llm:
+            # 获取最近5次训练数据
+            recent_data = pd.read_sql_query("SELECT * FROM workouts WHERE username = ? ORDER BY date DESC LIMIT 5", conn, params=(current_user,)).to_string()
+            with st.spinner("AI 教练正在分析 RPE 与强度模型..."):
                 try:
-                    prompt = f"基于数据:\n{user_data}\n\n给出专业简短的训练建议。"
+                    prompt = f"""
+                    作为专业力量教练，请分析以下用户的近期训练数据：
+                    {recent_data}
+                    
+                    请重点评估：
+                    1. 渐进负荷是否合理？(看 e1RM 趋势)
+                    2. 疲劳管理 (结合 RPE 和 次数)。如果 RPE 经常是 10 但重量没涨，不仅要指出，还要给建议。
+                    3. 给出下周训练建议。
+                    """
                     if st.session_state.vector_db:
                         retriever = st.session_state.vector_db.as_retriever()
-                        chain = create_retrieval_chain(retriever, create_stuff_documents_chain(llm, ChatPromptTemplate.from_messages([("system", "基于书籍:{context}\n分析:{input}")])))
-                        st.markdown(chain.invoke({"input": user_data})["answer"])
+                        chain = create_retrieval_chain(retriever, create_stuff_documents_chain(llm, ChatPromptTemplate.from_messages([("system", "参考书籍:{context}\n分析:{input}")])))
+                        st.markdown(chain.invoke({"input": prompt})["answer"])
                     else:
                         st.markdown(llm.invoke(prompt).content)
                 except Exception as e: st.error(f"失败: {e}")
